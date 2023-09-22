@@ -8,7 +8,7 @@ import (
 	"github.com/nikhil1raghav/kindle-send/util"
 )
 
-func Queue(downloadRequests []types.Request) []types.Request {
+func Queue(downloadRequests []types.Request, outputFileName string, coverUrl string) []types.Request {
 	var processedRequests []types.Request
 	for _, req := range downloadRequests {
 		switch req.Type {
@@ -16,7 +16,7 @@ func Queue(downloadRequests []types.Request) []types.Request {
 			processedRequests = append(processedRequests, req)
 			continue
 		case types.TypeUrl:
-			path, err := epubgen.Make([]string{req.Path}, "")
+			path, err := epubgen.Make([]string{req.Path}, outputFileName, coverUrl)
 			if err != nil {
 				util.Red.Printf("SKIPPING %s : %s\n", req.Path, err)
 			} else {
@@ -24,7 +24,7 @@ func Queue(downloadRequests []types.Request) []types.Request {
 			}
 		case types.TypeUrlFile:
 			links := util.ExtractLinks(req.Path)
-			path, err := epubgen.Make(links, "")
+			path, err := epubgen.Make(links, outputFileName, coverUrl)
 			if err != nil {
 				util.Red.Printf("SKIPPING %s : %s\n", req.Path, err)
 			} else {

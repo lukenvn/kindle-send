@@ -118,7 +118,7 @@ func (e *epubmaker) addContent(articles *[]readability.Article) error {
 }
 
 // Generates a single epub from a slice of urls, returns file path
-func Make(pageUrls []string, title string) (string, error) {
+func Make(pageUrls []string, title string, coverUrl string) (string, error) {
 	//TODO: Parallelize fetching pages
 
 	//Get readable article from urls
@@ -156,6 +156,11 @@ func Make(pageUrls []string, title string) (string, error) {
 	wg.Wait()
 
 	err := book.addContent(&readableArticles)
+	if len(coverUrl) != 0 {
+		coverImagePath, _ := book.Epub.AddImage(coverUrl, "cover.png")
+		book.Epub.SetCover(coverImagePath, "")
+	}
+
 	if err != nil {
 		return "", err
 	}

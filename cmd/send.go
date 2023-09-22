@@ -21,17 +21,21 @@ kindle-send auto detects if argument is a link, collection of links or an ebook.
 
 	helpExample = dedent.Dedent(`
 		# Send a single webpage
-		kindle-send send "http://paulgraham.com/alien.html"
+		kindle-send send "http://paulgraham.com/alien.html -o output-file-name -i cover.jpg "
 
 		# Send multiple webpages
-		kindle-send send "http://paulgraham.com/alien.html" "http://paulgraham.com/hwh.html"
+		kindle-send send "http://paulgraham.com/alien.html" "http://paulgraham.com/hwh.html -o output-file-name -i cover.jpg "
 
 		# Send webpage, collection of webpages and an ebook
-		kindle-send download "http://paulgraham.com/alien.html" links.txt "Some Book.epub"`,
+		kindle-send download "http://paulgraham.com/alien.html" links.txt "Some Book.epub -o output-file-name -i cover.jpg "`,
 	)
 )
 
 func init() {
+
+	flags := sendCmd.Flags()
+	flags.StringVarP(&outputFileName, "output", "o", "", "Output file name")
+	flags.StringVarP(&coverUrl, "cover-image", "i", "", "cover image url ")
 	sendCmd.PersistentFlags().IntP("mail-timeout", "m", 120, "Mail timeout in seconds, increase it if sending lot of files")
 }
 
@@ -49,7 +53,7 @@ var sendCmd = &cobra.Command{
 		}
 
 		downloadRequests := classifier.Classify(args)
-		downloadedRequests := handler.Queue(downloadRequests)
+		downloadedRequests := handler.Queue(downloadRequests, outputFileName, coverUrl)
 
 		timeout, err := cmd.Flags().GetInt("mail-timeout")
 		if err != nil {
