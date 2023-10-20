@@ -2,8 +2,13 @@ package epubgen
 
 import (
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,11 +22,11 @@ import (
 
 type epubmaker struct {
 	Epub      *epub.Epub
-	downloads map[string]string
+	downloads sync.Map
 }
 
 func NewEpubmaker(title string) *epubmaker {
-	downloadMap := make(map[string]string)
+	downloadMap := sync.Map{}
 	return &epubmaker{
 		Epub:      epub.NewEpub(title),
 		downloads: downloadMap,
@@ -29,7 +34,24 @@ func NewEpubmaker(title string) *epubmaker {
 }
 
 func fetchReadable(url string) (readability.Article, error) {
-	return readability.FromURL(url, 30*time.Second)
+	var article readability.Article
+	var err error
+
+	// Retry up to 3 times if the FromURL function returns an error or the title includes "502"
+	for retry := 1; retry <= 3; retry++ {
+		article, err = readability.FromURL(url, 30*time.Second)
+		if err == nil && !strings.Contains(article.Title, "502") {
+			break // Success or error contains "502", exit the loop
+		}
+		fmt.Printf("Failed to fetch readable content from %s: %s  will retry %i \n", url, article.Title, retry)
+		time.Sleep(3 * time.Second)
+	}
+
+	if err != nil {
+		return readability.Article{}, err
+	}
+
+	return article, nil
 }
 
 // Point remote image link to downloaded image
@@ -38,49 +60,101 @@ func (e *epubmaker) changeRefs(i int, img *goquery.Selection) {
 	img.RemoveAttr("srcset")
 	imgSrc, exists := img.Attr("src")
 	if exists {
-		if _, ok := e.downloads[imgSrc]; ok {
-			util.Green.Printf("Setting img src from %s to %s \n", imgSrc, e.downloads[imgSrc])
-			img.SetAttr("src", e.downloads[imgSrc])
+
+		src, o := e.downloads.Load(imgSrc)
+		if _, ok := src, o; ok {
+			util.Green.Printf("Setting img src from %s to %s \n", imgSrc, src)
+			img.SetAttr("src", src.(string))
 		}
 	}
 }
 
-// Download images and add to epub zip
-func (e *epubmaker) downloadImages(i int, img *goquery.Selection) {
+func (e *epubmaker) downloadImages(i int, img *goquery.Selection, tmpFolder string) {
 	util.CyanBold.Println("Downloading Images")
 	imgSrc, exists := img.Attr("src")
 
 	if exists {
-
-		//don't download same thing twice
-		if _, ok := e.downloads[imgSrc]; ok {
+		if _, ok := e.downloads.Load(imgSrc); ok {
 			return
 		}
+		var imgRef string
+		var err error
+		var imgPath string
 
-		//pass unique and safe image names here, then it will not crash on windows
-		//use murmur hash to generate file name
-		imageFileName := util.GetHash(imgSrc)
+		for retry := 1; retry <= 3; retry++ {
+			imageFileName := util.GetHash(imgSrc)
+			imgPath, err = downloadImage(imgSrc, imageFileName, tmpFolder)
 
-		imgRef, err := e.Epub.AddImage(imgSrc, imageFileName)
+			if err != nil {
+				util.Red.Printf("Couldn't download image %s: %s\n will retry in 3 seconds\n", imgSrc, err)
+				os.RemoveAll(imgPath)
+				time.Sleep(3 * time.Second)
+				continue
+			}
+
+			imgRef, err = e.Epub.AddImage(imgPath, imageFileName)
+			if err == nil {
+				break
+			}
+		}
 		if err != nil {
-			util.Red.Printf("Couldn't add image %s : %s\n", imgSrc, err)
+			util.Red.Printf("------ Couldn't add image %s : %s\n", imgSrc, err)
 			return
 		} else {
 			util.Green.Printf("Downloaded image %s\n", imgSrc)
-			e.downloads[imgSrc] = imgRef
+			e.downloads.Store(imgSrc, imgRef)
 		}
 	}
 }
+func downloadImage(url, filename string, tmpFolder string) (string, error) {
+	filePath := filepath.Join(tmpFolder, filename)
+	if _, err := os.Stat(filePath); err == nil {
+		util.Green.Printf("Skip download, %s already existed %s \n", url, filePath)
+		return filePath, nil
+	}
+	var response *http.Response
+	var err error
+	var attempts int
+	const maxAttempts = 3
+	for {
+		attempts++
+		response, err = http.Get(url)
+		if err != nil || response.StatusCode != 200 {
+			if attempts < maxAttempts {
+				util.Red.Printf("Failed to get %s at %d try \n", url, attempts+1)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			util.Red.Printf("Can not to get %s after 3 attemps \n", url)
+			return "", err
+		}
+		break
+	}
+	defer response.Body.Close()
+	file, err := os.Create(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, response.Body)
+	if err != nil {
+		return "", err
+	}
+	return filePath, nil
+}
 
 // Fetches images in article and then embeds them into epub
-func (e *epubmaker) embedImages(wg *sync.WaitGroup, article *readability.Article) {
+func (e *epubmaker) embedImages(wg *sync.WaitGroup, article *readability.Article, tmpFolder string) {
 	util.Cyan.Println("Embedding images in ", article.Title)
 	defer wg.Done()
 	//TODO: Compress images before embedding to improve size
 	doc := goquery.NewDocumentFromNode(article.Node)
 
 	//download all images
-	doc.Find("img").Each(e.downloadImages)
+	doc.Find("img").Each(func(i int, img *goquery.Selection) {
+		e.downloadImages(i, img, tmpFolder)
+	})
 
 	//Change all refs, doing it in two phases to download repeated images only once
 	doc.Find("img").Each(e.changeRefs)
@@ -123,6 +197,8 @@ func Make(pageUrls []string, title string, coverUrl string) (string, error) {
 
 	//Get readable article from urls
 	readableArticles := make([]readability.Article, 0)
+	tmpFolder := fmt.Sprintf("tmp-%s", util.GenHash(strings.Join(pageUrls, "-")))
+	_ = os.Mkdir(tmpFolder, 0755)
 	for _, pageUrl := range pageUrls {
 		article, err := fetchReadable(pageUrl)
 		if err != nil {
@@ -150,7 +226,7 @@ func Make(pageUrls []string, title string, coverUrl string) (string, error) {
 
 	for i := 0; i < len(readableArticles); i++ {
 		wg.Add(1)
-		go book.embedImages(&wg, &readableArticles[i])
+		go book.embedImages(&wg, &readableArticles[i], tmpFolder)
 	}
 
 	wg.Wait()
@@ -164,6 +240,25 @@ func Make(pageUrls []string, title string, coverUrl string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	storeDir, err := getStoreDir(err)
+
+	titleSlug := slug.Make(title)
+	var filename string
+	if len(titleSlug) == 0 {
+		filename = "kindle-send-doc-" + tmpFolder + ".epub"
+	} else {
+		filename = titleSlug + ".epub"
+	}
+	filepath := path.Join(storeDir, filename)
+	err = book.Epub.Write(filepath)
+	if err != nil {
+		return "", err
+	}
+	os.RemoveAll(tmpFolder)
+	return filepath, nil
+}
+
+func getStoreDir(err error) (string, error) {
 	var storeDir string
 	if len(config.GetInstance().StorePath) == 0 {
 		storeDir, err = os.Getwd()
@@ -174,18 +269,5 @@ func Make(pageUrls []string, title string, coverUrl string) (string, error) {
 	} else {
 		storeDir = config.GetInstance().StorePath
 	}
-
-	titleSlug := slug.Make(title)
-	var filename string
-	if len(titleSlug) == 0 {
-		filename = "kindle-send-doc-" + util.GetHash(readableArticles[0].Content) + ".epub"
-	} else {
-		filename = titleSlug + ".epub"
-	}
-	filepath := path.Join(storeDir, filename)
-	err = book.Epub.Write(filepath)
-	if err != nil {
-		return "", err
-	}
-	return filepath, nil
+	return storeDir, err
 }
