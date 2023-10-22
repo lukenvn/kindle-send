@@ -36,14 +36,12 @@ func NewEpubmaker(title string) *epubmaker {
 func fetchReadable(url string) (readability.Article, error) {
 	var article readability.Article
 	var err error
-
-	// Retry up to 3 times if the FromURL function returns an error or the title includes "502"
 	for retry := 1; retry <= 3; retry++ {
 		article, err = readability.FromURL(url, 30*time.Second)
 		if err == nil && !strings.Contains(article.Title, "502") {
-			break // Success or error contains "502", exit the loop
+			break
 		}
-		fmt.Printf("Failed to fetch readable content from %s: %s  will retry %i \n", url, article.Title, retry)
+		fmt.Printf("Failed to fetch readable content from %s: %s  will retry %d \n", url, article.Title, retry)
 		time.Sleep(3 * time.Second)
 	}
 
@@ -87,7 +85,6 @@ func (e *epubmaker) downloadImages(i int, img *goquery.Selection, tmpFolder stri
 
 			if err != nil {
 				util.Red.Printf("Couldn't download image %s: %s\n will retry in 3 seconds\n", imgSrc, err)
-				os.RemoveAll(imgPath)
 				time.Sleep(3 * time.Second)
 				continue
 			}
@@ -122,7 +119,7 @@ func downloadImage(url, filename string, tmpFolder string) (string, error) {
 		if err != nil || response.StatusCode != 200 {
 			if attempts < maxAttempts {
 				util.Red.Printf("Failed to get %s at %d try \n", url, attempts+1)
-				time.Sleep(2 * time.Second)
+				time.Sleep(time.Second)
 				continue
 			}
 			util.Red.Printf("Can not to get %s after 3 attemps \n", url)
@@ -139,6 +136,7 @@ func downloadImage(url, filename string, tmpFolder string) (string, error) {
 
 	_, err = io.Copy(file, response.Body)
 	if err != nil {
+		_ = os.Remove(filePath)
 		return "", err
 	}
 	return filePath, nil
@@ -193,23 +191,11 @@ func (e *epubmaker) addContent(articles *[]readability.Article) error {
 
 // Generates a single epub from a slice of urls, returns file path
 func Make(pageUrls []string, title string, coverUrl string) (string, error) {
-	//TODO: Parallelize fetching pages
-
-	//Get readable article from urls
-	readableArticles := make([]readability.Article, 0)
 	tmpFolder := fmt.Sprintf("tmp-%s", util.GenHash(strings.Join(pageUrls, "-")))
 	_ = os.Mkdir(tmpFolder, 0755)
-	for _, pageUrl := range pageUrls {
-		article, err := fetchReadable(pageUrl)
-		if err != nil {
-			util.Red.Printf("Couldn't convert %s because %s", pageUrl, err)
-			util.Magenta.Println("SKIPPING ", pageUrl)
-			continue
-		}
-		util.Green.Printf("Fetched %s --> %s\n", pageUrl, article.Title)
-		readableArticles = append(readableArticles, article)
-	}
+	defer os.RemoveAll(tmpFolder)
 
+	readableArticles := getReadableArticles(pageUrls)
 	if len(readableArticles) == 0 {
 		return "", errors.New("No readable url given, exiting without creating epub")
 	}
@@ -254,8 +240,35 @@ func Make(pageUrls []string, title string, coverUrl string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	os.RemoveAll(tmpFolder)
+
 	return filepath, nil
+}
+
+type ReadableResult struct {
+	Index   int
+	Article readability.Article
+}
+
+func fetchURL(url string, index int, ch chan<- ReadableResult) {
+	article, err := fetchReadable(url)
+	if err != nil {
+		util.Red.Printf("Couldn't convert %s because %s", url, err)
+		util.Magenta.Println("SKIPPING ", url)
+	}
+	util.Green.Printf("Fetched %s --> %s\n", url, article.Title)
+	ch <- ReadableResult{Article: article, Index: index}
+}
+func getReadableArticles(pageUrls []string) []readability.Article {
+	readableArticles := make([]readability.Article, len(pageUrls))
+	ch := make(chan ReadableResult, len(pageUrls))
+	for i, url := range pageUrls {
+		go fetchURL(url, i, ch)
+	}
+	for i := 0; i < len(pageUrls); i++ {
+		article := <-ch
+		readableArticles[article.Index] = article.Article
+	}
+	return readableArticles
 }
 
 func getStoreDir(err error) (string, error) {
